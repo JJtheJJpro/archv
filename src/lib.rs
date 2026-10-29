@@ -10,26 +10,83 @@ use core::fmt::Display;
 
 #[derive(Debug)]
 pub enum ArchInfo {
-    X86_64 { level: &'static str },
-    X86 { level: &'static str },
-    AArch64 { version: &'static str },
-    Arm32 { version: &'static str },
+    X86_64 {
+        level: &'static str,
+    },
+    X86 {
+        level: &'static str,
+    },
+    AArch64 {
+        version: &'static str,
+        registers: Option<Aarch64CpuRegisters>,
+    },
+    Arm32 {
+        version: &'static str,
+        registers: Option<Arm32CpuRegisters>,
+    },
     Other(&'static str),
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct Aarch64CpuRegisters {
+    pub midr_el1: u64,
+    pub id_aa64pfr0_el1: u64,
+    pub id_aa64isar0_el1: u64,
+    pub id_aa64mmfr0_el1: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Arm32CpuRegisters {
+    pub midr: u32,
+    pub id_pfr0: u32,
+    pub id_pfr1: u32,
+    pub id_isar0: u32,
+    pub id_isar1: u32,
+    pub id_isar2: u32,
+    pub id_isar3: u32,
+    pub id_isar4: u32,
+    pub id_isar5: u32,
+}
+
 impl Display for ArchInfo {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::X86_64 { level } => {
                 write!(f, "{level}")
             }
-            Self::X86 { level } => {
-                write!(f, "{level}")
+            Self::X86 { level } => write!(f, "{level}"),
+            Self::AArch64 { version, registers } => {
+                write!(f, "{version}")?;
+                if let Some(registers) = registers {
+                    write!(
+                        f,
+                        "; MIDR_EL1={:#018x} ID_AA64PFR0_EL1={:#018x} ID_AA64ISAR0_EL1={:#018x} ID_AA64MMFR0_EL1={:#018x}",
+                        registers.midr_el1,
+                        registers.id_aa64pfr0_el1,
+                        registers.id_aa64isar0_el1,
+                        registers.id_aa64mmfr0_el1,
+                    )?;
+                }
+                Ok(())
             }
-            Self::AArch64 { version } => {
-                write!(f, "{version}")
-            }
-            Self::Arm32 { version } => {
-                write!(f, "{version}")
+            Self::Arm32 { version, registers } => {
+                write!(f, "{version}")?;
+                if let Some(registers) = registers {
+                    write!(
+                        f,
+                        "; MIDR={:#010x} ID_PFR0={:#010x} ID_PFR1={:#010x} ID_ISAR0={:#010x} ID_ISAR1={:#010x} ID_ISAR2={:#010x} ID_ISAR3={:#010x} ID_ISAR4={:#010x} ID_ISAR5={:#010x}",
+                        registers.midr,
+                        registers.id_pfr0,
+                        registers.id_pfr1,
+                        registers.id_isar0,
+                        registers.id_isar1,
+                        registers.id_isar2,
+                        registers.id_isar3,
+                        registers.id_isar4,
+                        registers.id_isar5,
+                    )?;
+                }
+                Ok(())
             }
             Self::Other(other) => {
                 write!(f, "{other}")
@@ -39,7 +96,7 @@ impl Display for ArchInfo {
 }
 
 pub fn detect_arch_and_version() -> ArchInfo {
-    if cfg!(target_arch = "x86_64") {
+    if cfg!(target_arch = "x86_64") || cpu_supports_x86_64() {
         ArchInfo::X86_64 {
             level: detect_x86_64_level(),
         }
@@ -50,13 +107,40 @@ pub fn detect_arch_and_version() -> ArchInfo {
     } else if cfg!(target_arch = "aarch64") {
         ArchInfo::AArch64 {
             version: detect_aarch64_version(),
+            registers: read_aarch64_cpu_registers(),
         }
     } else if cfg!(target_arch = "arm") {
         ArchInfo::Arm32 {
             version: detect_arm32_version(),
+            registers: read_arm32_cpu_registers(),
         }
     } else {
         ArchInfo::Other(get_target_arch_str())
+    }
+}
+
+pub fn cpu_supports_x86_64() -> bool {
+    #[cfg(target_arch = "x86")]
+    {
+        use core::arch::x86::__cpuid;
+
+        let max_extended_leaf = __cpuid(0x8000_0000).eax;
+        if max_extended_leaf < 0x8000_0001 {
+            return false;
+        }
+
+        let extended_features = __cpuid(0x8000_0001);
+        (extended_features.edx & (1u32 << 29)) != 0
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        true
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
     }
 }
 
@@ -80,8 +164,11 @@ pub const fn get_target_arch_str() -> &'static str {
 // Bare-Metal / no_std x86_64 CPUID Microarchitecture Detection
 // ---------------------------------------------------------
 fn detect_x86_64_level() -> &'static str {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::__cpuid;
+        #[cfg(target_arch = "x86_64")]
         use core::arch::x86_64::__cpuid;
 
         // Helper closures to test specific register bits
@@ -162,7 +249,7 @@ fn detect_x86_64_level() -> &'static str {
         "x86-64-v1"
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     "N/A"
 }
 
@@ -202,7 +289,7 @@ fn detect_x86_level() -> &'static str {
 fn detect_arm32_version() -> &'static str {
     #[cfg(target_arch = "arm")]
     {
-        "ARM32 (AArch32 / Armv7-A baseline)"
+        "ARM32 (AArch32; privileged ID registers are opt-in)"
     }
 
     #[cfg(not(target_arch = "arm"))]
@@ -215,12 +302,63 @@ fn detect_arm32_version() -> &'static str {
 fn detect_aarch64_version() -> &'static str {
     #[cfg(target_arch = "aarch64")]
     {
-        // Without an OS (e.g. Linux hwcap or macOS sysctl), reading system registers
-        // directly (like ID_AA64ISAR0_EL1) requires Kernel/EL1 privileges.
-        // In bare-metal/EL0 user space, we safely report the baseline ISA target.
-        "Armv8.0-A (Baseline / Unpivileged)"
+        "AArch64 (Armv8.0-A baseline; privileged ID registers are opt-in)"
     }
 
     #[cfg(not(target_arch = "aarch64"))]
     "N/A"
+}
+
+fn read_aarch64_cpu_registers() -> Option<Aarch64CpuRegisters> {
+    #[cfg(all(target_arch = "aarch64", feature = "arm-privileged-registers"))]
+    {
+        let (midr_el1, id_aa64pfr0_el1, id_aa64isar0_el1, id_aa64mmfr0_el1);
+        unsafe {
+            core::arch::asm!("mrs {value}, MIDR_EL1", value = out(reg) midr_el1, options(nomem, nostack));
+            core::arch::asm!("mrs {value}, ID_AA64PFR0_EL1", value = out(reg) id_aa64pfr0_el1, options(nomem, nostack));
+            core::arch::asm!("mrs {value}, ID_AA64ISAR0_EL1", value = out(reg) id_aa64isar0_el1, options(nomem, nostack));
+            core::arch::asm!("mrs {value}, ID_AA64MMFR0_EL1", value = out(reg) id_aa64mmfr0_el1, options(nomem, nostack));
+        }
+        Some(Aarch64CpuRegisters {
+            midr_el1,
+            id_aa64pfr0_el1,
+            id_aa64isar0_el1,
+            id_aa64mmfr0_el1,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", feature = "arm-privileged-registers")))]
+    None
+}
+
+fn read_arm32_cpu_registers() -> Option<Arm32CpuRegisters> {
+    #[cfg(all(target_arch = "arm", feature = "arm-privileged-registers"))]
+    {
+        let (midr, id_pfr0, id_pfr1, id_isar0, id_isar1, id_isar2, id_isar3, id_isar4, id_isar5);
+        unsafe {
+            core::arch::asm!("mrc p15, #0, {value}, c0, c0, #0", value = out(reg) midr, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c1, #0", value = out(reg) id_pfr0, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c1, #1", value = out(reg) id_pfr1, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #0", value = out(reg) id_isar0, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #1", value = out(reg) id_isar1, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #2", value = out(reg) id_isar2, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #3", value = out(reg) id_isar3, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #4", value = out(reg) id_isar4, options(nomem, nostack));
+            core::arch::asm!("mrc p15, #0, {value}, c0, c2, #5", value = out(reg) id_isar5, options(nomem, nostack));
+        }
+        Some(Arm32CpuRegisters {
+            midr,
+            id_pfr0,
+            id_pfr1,
+            id_isar0,
+            id_isar1,
+            id_isar2,
+            id_isar3,
+            id_isar4,
+            id_isar5,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "arm", feature = "arm-privileged-registers")))]
+    None
 }
